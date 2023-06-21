@@ -7,9 +7,13 @@ Ray tracing algorithm that uses the image method to compute all pure reflection
 paths.
 """
 
+from functools import cached_property
+
 import mitsuba as mi
 import drjit as dr
 import tensorflow as tf
+
+from tqdm import trange
 
 from sionna.constants import SPEED_OF_LIGHT
 from sionna.utils.tensors import expand_to_rank
@@ -151,6 +155,8 @@ class Solver(SolverBase):
             # with length up to ``max_depth``
             candidates = self._list_candidates_stochastic(max_depth, sources,
                                 num_samples=num_samples, seed=seed)
+
+        print("candidates", candidates)
 
         # Compute specular paths from candidates
         # Returns: mask, vertices, normals, objects
@@ -544,6 +550,54 @@ class Solver(SolverBase):
         val = self._mi_to_tf_tensor(mi_val, tf.bool)
         return val
 
+    @cached_property
+    def _edges(self):
+        # [num triangles, 3, 3]
+        primitives = self._primitives
+        num_triangles = primitives.shape[0]
+
+        # [num triangles, 3]
+        normals, _ = normalize(self._normals)
+
+        edges = []
+        
+        for i in trange(num_triangles, leave=False, desc="Computing edges"):
+            for j in range(i + 1, num_triangles):
+                
+                n1 = normals[i, :]
+                n2 = normals[j, :]
+                
+                dot = tf.tensordot(n1, n2, axes=1)  # cos(...)
+                
+                if tf.experimental.numpy.allclose(tf.abs(dot), 1):
+                    # Co-planar triangles are discarded
+                    continue
+                
+                t1_vertices = primitives[i, :, :]
+                t2_vertices = primitives[j, :, :]
+                
+                matching_vertices = []
+                
+                for vertex in t1_vertices:
+                    diff = t2_vertices - vertex
+                    
+                    idx = tf.where(
+                        tf.linalg.norm(diff, axis=1) == 0.0
+                    )
+                    
+                    assert len(idx) < 2, "Only two vertices can match"
+                    
+                    if len(idx) == 1:
+                        matching_vertices.append(t2_vertices[idx[0, 0], :])
+                
+                assert len(matching_vertices) < 3, "Two different triangles cannot share more than 2 vertices"
+                
+                if len(matching_vertices) == 2:
+                    edge = tf.stack(matching_vertices)
+                    edges.append(edge)
+                
+        return tf.stack(edges)
+
     def _image_method(self, candidates, sources, targets):
         # pylint: disable=line-too-long
         r"""
@@ -589,6 +643,9 @@ class Solver(SolverBase):
         # Number of sources and number of receivers
         num_src = len(sources)
         num_targets = len(targets)
+
+        # Gather edges
+        edges = self._edges
 
         # --- Phase 1
         # Starting from the sources, mirror each point against the
