@@ -551,52 +551,185 @@ class Solver(SolverBase):
         return val
 
     @cached_property
-    def _edges(self):
-        # [num triangles, 3, 3]
-        primitives = self._primitives
-        num_triangles = primitives.shape[0]
+    def _vertices(self):
+        """
+        Returns the vertices, ordered by primitive.
 
-        # [num triangles, 3]
+        Output
+        -------
+        vertices: [3 * num_primitives, 3], tf.float
+            The vertices.
+        """
+        return tf.reshape(self._primitives, (-1, 3))
+
+    @cached_property
+    def _non_coplanar_matrix(self):
+        """
+        Returns a matrix that indicates whether two primitives are non-coplanar.
+
+        Output
+        -------
+        non_coplanar_matrix: [num_primitives, num_primitives], tf.bool
+            The matrix.
+        """
         normals, _ = normalize(self._normals)
+        dot_products = tf.tensordot(normals, normals, axes=[[1], [1]])
 
-        edges = []
-        
-        for i in trange(num_triangles, leave=False, desc="Computing edges"):
-            for j in range(i + 1, num_triangles):
-                
-                n1 = normals[i, :]
-                n2 = normals[j, :]
-                
-                dot = tf.tensordot(n1, n2, axes=1)  # cos(...)
-                
-                if tf.experimental.numpy.allclose(tf.abs(dot), 1):
-                    # Co-planar triangles are discarded
-                    continue
-                
-                t1_vertices = primitives[i, :, :]
-                t2_vertices = primitives[j, :, :]
-                
-                matching_vertices = []
-                
-                for vertex in t1_vertices:
-                    diff = t2_vertices - vertex
-                    
-                    idx = tf.where(
-                        tf.linalg.norm(diff, axis=1) == 0.0
-                    )
-                    
-                    assert len(idx) < 2, "Only two vertices can match"
-                    
-                    if len(idx) == 1:
-                        matching_vertices.append(t2_vertices[idx[0, 0], :])
-                
-                assert len(matching_vertices) < 3, "Two different triangles cannot share more than 2 vertices"
-                
-                if len(matching_vertices) == 2:
-                    edge = tf.stack(matching_vertices)
-                    edges.append(edge)
-                
-        return tf.stack(edges)
+        return tf.abs(dot_products) < 1.0 - SolverBase.EPSILON
+
+    @cached_property
+    def _distance_matrix(self):
+        """
+        Returns the pairwise distance matrix between vertices.
+
+        Inspired from answer https://stackoverflow.com/a/40053188.
+
+        Solution https://stackoverflow.com/a/37040451 was discarded because
+        it accumulate to much numerical errors, causing non-zero values on
+        the main diagonal.
+
+        Output
+        -------
+        distance_matrix: [3 * num_primitives, 3 * num_primitives], tf.float
+            The matrix.
+        """
+        vertices = self._vertices
+        return tf.reduce_sum(
+            tf.math.squared_difference(
+                tf.expand_dims(vertices, 1),
+                tf.expand_dims(vertices, 0)
+            ),
+            2
+        )
+
+    @cached_property
+    def _shared_vertices_matrix(self):
+        """
+        Returns the pairwise shared vertices matrix.
+
+        A True entry for A[i, j] means that vertices i and j are
+        considered to be equal (i.e., spatially close enough).
+
+        Output
+        -------
+        shared_vertices_matrix: [3 * num_primitives, 3 * num_primitives], tf.bool
+            The matrix.
+        """
+        distance_matrix = self._distance_matrix
+        return distance_matrix < SolverBase.EPSILON
+
+    @cached_property
+    def _shared_vertices_matrix_reshaped(self):
+        """
+        Returns the pairwise shared vertices matrix, but reshaped
+        by number of primitives.
+
+        See :py:meth:`_shared_vertices_matrix` for more details.
+
+        Output
+        -------
+        shared_vertices_matrix_reshaped: [num_primitives, 3, num_primitives, 3], tf.bool
+            The matrix.
+        """
+        num_primitives = self._primitives.shape[0]
+        shared_vertices_matrix = self._shared_vertices_matrix
+        return tf.reshape(
+            shared_vertices_matrix,
+            (num_primitives, 3, num_primitives, 3),
+        )
+
+    @cached_property
+    def _number_shared_vertices_matrix(self):
+        """
+        Returns the pairwise number of shared vertices
+        between primitives.
+
+        Each entry indicates how many vertices to primitives have in common.
+
+        Output
+        -------
+        number_shared_vertices_matrix: [num_primitives, num_primitives], tf.int
+            The matrix.
+        """
+        shared_vertices_matrix_reshaped = self._shared_vertices_matrix_reshaped
+        return tf.reduce_sum(
+            tf.cast(
+                shared_vertices_matrix_reshaped,
+                tf.int32
+            ),
+            [1, 3]
+        )
+
+    @cached_property
+    def _edges(self):
+        """
+        Returns the array of edges, and the corresponding
+        primitive indices (first).
+
+        Output
+        -------
+        primitive_indices: [num_edges, 2], tf.int
+            Indices of the primitives connected by corresponding edges.
+
+        edges: [num_edges, 2, 3], tf.float
+            Edge vertices.
+        """
+
+        # For an edge to be valid, it must:
+        # - belong to two primitives
+        # - that are not coplanar
+
+        # [num_primitives, num_primitives]
+        non_coplanar_matrix = self._non_coplanar_matrix
+
+        # [num_primitives, num_primitives]
+        number_shared_vertices_matrix = self._number_shared_vertices_matrix
+
+        # primitives that share one edge must share exactly 2 vertices
+        # [num_primitives, num_primitives]
+        primitives_share_one_edge = number_shared_vertices_matrix == 2
+
+        # We look for primitives that match both conditions
+        # [num_primitives, num_primitives]
+        condition = tf.logical_and(non_coplanar_matrix, primitives_share_one_edge)
+
+        # We use a mask to only keep the upper triangular part of the matrix,
+        # because symmetry induces duplicates otherwise.
+        # [num_primitives, num_primitives]
+        masked_condition = tf.linalg.band_part(condition, 0, -1)
+
+        # We retrieve indices where condition is met
+        # [num_edges, 2]
+        primitive_indices = tf.where(masked_condition)
+
+        # [num_primitives, 3, num_primitives, 3]
+        shared_vertices_matrix_reshaped = self._shared_vertices_matrix_reshaped 
+
+        # We transpose (permute) so we can easily use tf.gather_nd
+        # [num_primitives, num_primitives, 3, 3]
+        shared_vertices_matrix_transposed = tf.transpose(
+            shared_vertices_matrix_reshaped,
+            perm=[0, 2, 1, 3]
+        )
+
+        # [2 * num_edges, 3]
+        vertex_indices = tf.where(
+            tf.gather_nd(
+                shared_vertices_matrix_transposed,
+                primitive_indices
+            )
+        )
+
+        # [num_primitives, 3, 3]
+        primitives = self._primitives
+
+        # [num_edges, 2, 3]
+        edges = tf.reshape(
+            tf.gather_nd(primitives, vertex_indices[:, :2]),
+            (-1, 2, 3)
+        )
+
+        return primitive_indices, edges
 
     def _image_method(self, candidates, sources, targets):
         # pylint: disable=line-too-long
@@ -645,7 +778,7 @@ class Solver(SolverBase):
         num_targets = len(targets)
 
         # Gather edges
-        edges = self._edges
+        #edges = self._edges
 
         # --- Phase 1
         # Starting from the sources, mirror each point against the
