@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 
@@ -167,7 +167,7 @@ class TestCovMap(unittest.TestCase):
 
         cm_cell_size = np.array([1., 1.])
         batch_size = 100
-        tx_pos = np.array([0.,0.,0.])
+        tx_pos = np.array([1.,1.,2.])
 
         # load simple scene with different dtypes
         for dt in (tf.complex64, tf.complex128):

@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """Layers for cyclic redundancy checks (CRC) and utility functions"""
@@ -224,6 +224,11 @@ class CRCEncoder(Layer):
         x_crc = tf.matmul(x_exp32, self._g_mat_crc) # calculate crc bits
 
         # take modulo 2 of x_crc (bitwise operations instead of tf.mod)
+
+        # cast to tf.int64 first as TF 2.15 has an XLA bug with casting directly
+        # to tf.int32
+        x_crc = tf.cast(x_crc, dtype=tf.int64)
+
         x_crc = int_mod_2(x_crc)
         x_crc = tf.cast(x_crc, dtype=self.dtype)
 

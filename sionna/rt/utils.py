@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 """
@@ -7,6 +7,7 @@ Ray tracer utilities
 """
 
 import tensorflow as tf
+import mitsuba as mi
 import drjit as dr
 
 from sionna.utils import expand_to_rank
@@ -117,7 +118,16 @@ def theta_phi_from_unit_vec(v):
     y = v[...,1]
     z = v[...,2]
 
-    # Clip to ensure numerical stability
+    # If v = z, then x = 0 and y = 0. In this case, atan2 is not differentiable,
+    # leading to NaN when computing the gradients.
+    # The following lines force x to one this case. Note that this does not
+    # impact the output meaningfully, as in that case theta = 0 and phi can
+    # take any value.
+    zero = tf.zeros_like(x)
+    is_unit_z = tf.logical_and(tf.equal(x, zero), tf.equal(y, zero))
+    is_unit_z = tf.cast(is_unit_z, x.dtype)
+    x += is_unit_z
+
     theta = acos_diff(z)
     phi = tf.math.atan2(y, x)
     return theta, phi
@@ -248,9 +258,7 @@ def dot(u, v, keepdim=False, clip=False):
         The last dimension is removed if ``keepdim``
         is set to `False`.
     """
-    res = tf.linalg.matvec(tf.expand_dims(u, -2), v)
-    if not keepdim:
-        res = tf.squeeze(res,axis=-1)
+    res = tf.reduce_sum(u*v, axis=-1, keepdims=keepdim)
     if clip:
         one = tf.ones((), u.dtype)
         res = tf.clip_by_value(res, -one, one)
@@ -575,39 +583,31 @@ def scene_scale(scene):
 
 def fibonacci_lattice(num_points, dtype=tf.float32):
     """
-    Generates a Fibonacci lattice for the unit 3D sphere
+    Generates a Fibonacci lattice for the unit square
 
     Input
     -----
     num_points : int
         Number of points
 
+    type : tf.DType
+        Datatype to use for the output
+
     Output
     -------
-    points : [num_points, 3]
+    points : [num_points, 2]
         Generated rectangular coordinates of the lattice points
     """
 
-    golden_ratio = tf.cast((1.+tf.sqrt(5.))/2., dtype)
+    golden_ratio = (1.+tf.sqrt(tf.cast(5., tf.float64)))/2.
+    ns = tf.range(0, num_points, dtype=tf.float64)
 
-    if (num_points%2) == 0:
-        min_n = -num_points//2
-        max_n = num_points//2 - 1
-    else:
-        min_n = -(num_points-1)//2
-        max_n = (num_points-1)//2
+    x = ns/golden_ratio
+    x = x - tf.floor(x)
+    y = ns/(num_points-1)
+    points = tf.stack([x,y], axis=1)
 
-    ns = tf.range(min_n, max_n+1, dtype=dtype)
-
-    # Spherical coordinate
-    phis = 2.*PI*ns/golden_ratio
-    thetas = tf.math.acos(2.*ns/num_points)
-
-    # Rectangular coordinates
-    x = tf.sin(thetas)*tf.cos(phis)
-    y = tf.sin(thetas)*tf.sin(phis)
-    z = tf.cos(thetas)
-    points = tf.stack([x,y,z], axis=1)
+    points = tf.cast(points, dtype)
 
     return points
 
@@ -767,3 +767,33 @@ def acos_diff(x, epsilon=1e-7):
     acos_x_1 =  tf.acos(x_1)
     y = acos_x_1 + tf.stop_gradient(tf.acos(x_clip_1)-acos_x_1)
     return y
+
+def angles_to_mitsuba_rotation(angles):
+    """
+    Build a Mitsuba transform from angles in radian
+
+    Input
+    ------
+    angles : [3], tf.float
+        Angles [rad]
+
+    Output
+    -------
+    : :class:`mitsuba.ScalarTransform4f`
+        Mitsuba rotation
+    """
+
+    angles = 180. * angles / PI
+
+    if angles.dtype == tf.float32:
+        mi_transform_t = mi.Transform4f
+        angles = mi.Float(angles)
+    else:
+        mi_transform_t = mi.Transform4d
+        angles = mi.Float64(angles)
+
+    return (
+          mi_transform_t.rotate(axis=[0., 0., 1.], angle=angles[0])
+        @ mi_transform_t.rotate(axis=[0., 1., 0.], angle=angles[1])
+        @ mi_transform_t.rotate(axis=[1., 0., 0.], angle=angles[2])
+    )
